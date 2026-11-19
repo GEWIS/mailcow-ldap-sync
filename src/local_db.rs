@@ -191,27 +191,32 @@ pub async fn get_unchecked_active_users(pool: &SqlitePool, session_time: i64) ->
     Ok(rows.into_iter().filter_map(|row| row.try_get("email").ok()).collect())
 }
 
-/// Update a user's send-on-behalf list in the local database (deduplicated).
-pub async fn edit_local_user_permissions(pool: &SqlitePool, mail: &str, sob_emails: &[String]) -> Result<()> {
-    let user = fetch_local_user(pool, mail)
-        .await?
-        .with_context(|| format!("Local user {mail} not found"))?;
-    let mut sobs: Vec<String> = if user.new_mail_perm_sob.is_empty() {
-        Vec::new()
-    } else {
-        user.new_mail_perm_sob.split(';').map(str::to_string).collect()
+/// Get all emails stored in the local database.
+pub async fn get_all_emails(pool: &SqlitePool) -> Result<Vec<String>> {
+    let rows = sqlx::query("SELECT email FROM users").fetch_all(pool).await?;
+    Ok(rows.into_iter().filter_map(|row| row.try_get("email").ok()).collect())
+}
+
+/// Replace a user's pending send-on-behalf list (sorted, deduplicated). An empty
+/// list clears the pending entries, so removals from SOB groups propagate.
+/// Returns `false` when the user does not exist in the local database.
+pub async fn set_sob_pending(pool: &SqlitePool, mail: &str, sob_emails: &[String]) -> Result<bool> {
+    let Some(user) = fetch_local_user(pool, mail).await? else {
+        return Ok(false);
     };
-    for sob in sob_emails {
-        if !sobs.contains(sob) {
-            sobs.push(sob.clone());
-        }
+    let mut sobs: Vec<String> = sob_emails.to_vec();
+    sobs.sort_unstable();
+    sobs.dedup();
+    let joined = sobs.join(";");
+    if user.new_mail_perm_sob == joined {
+        return Ok(true);
     }
     sqlx::query("UPDATE users SET newMailPermSOB = ? WHERE email = ?")
-        .bind(sobs.join(";"))
+        .bind(joined)
         .bind(mail)
         .execute(pool)
         .await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Get all local users of which the SOB has changed in this session. Applies the
@@ -347,26 +352,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sob_accumulation_and_change_detection() {
+    async fn sob_pending_replaced_and_cleared() {
         let pool = test_pool().await;
         create_user(&pool, "e@example.local", "E", 1, 100).await.unwrap();
 
-        edit_local_user_permissions(&pool, "e@example.local", &["g1@x".into(), "g2@x".into()])
-            .await
-            .unwrap();
-        // Duplicate SOB entries are not added twice.
-        edit_local_user_permissions(&pool, "e@example.local", &["g2@x".into(), "g3@x".into()])
-            .await
-            .unwrap();
+        // Unknown users are reported so callers can warn about them.
+        assert!(
+            !set_sob_pending(&pool, "missing@example.local", &["g1@x".into()])
+                .await
+                .unwrap()
+        );
 
+        // The pending list is replaced (sorted, deduplicated), not appended to.
+        assert!(
+            set_sob_pending(
+                &pool,
+                "e@example.local",
+                &["g2@x".into(), "g1@x".into(), "g1@x".into()]
+            )
+            .await
+            .unwrap()
+        );
         let changed = get_sob_changed_users(&pool).await.unwrap();
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].email, "e@example.local");
-        assert_eq!(changed[0].mail_perm_sob, "g1@x;g2@x;g3@x");
-        // The pending list is synced to the applied value.
-        assert_eq!(changed[0].new_mail_perm_sob, "g1@x;g2@x;g3@x");
-
-        // Second pass: nothing pending anymore.
+        assert_eq!(changed[0].mail_perm_sob, "g1@x;g2@x");
         assert!(get_sob_changed_users(&pool).await.unwrap().is_empty());
+
+        // An empty desired list clears the SOB entries, so removals propagate.
+        assert!(set_sob_pending(&pool, "e@example.local", &[]).await.unwrap());
+        let changed = get_sob_changed_users(&pool).await.unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].mail_perm_sob, "");
     }
 }

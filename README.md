@@ -4,7 +4,8 @@ Syncs LDAP (e.g. Active Directory) users into [mailcow-dockerized](https://githu
 
 It periodically:
 
-- creates mailcow mailboxes for LDAP users and deactivates ones that disappear or get disabled (with a configurable grace period),
+- creates mailcow mailboxes for LDAP users and deactivates ones that disappear from LDAP (with a configurable grace period),
+- AD-disabled accounts (`userAccountControl` `ACCOUNTDISABLE`) keep receiving mail but lose login (mailcow active state `2`); only accounts that disappear from LDAP are deactivated after the grace period,
 - syncs display names,
 - syncs mailbox ACLs (read/read-write on folders) through the doveadm HTTP API from `mailPermRO`, `mailPermROInbox`, `mailPermROSent`, `mailPermRW` group attributes,
 - syncs *send on behalf* (`sender_acl`) from `mailPermSOB` groups (including mailcow aliases),
@@ -83,6 +84,22 @@ The port fixes bugs where the TS behavior clearly diverged from the intent:
 - BCC maps: existing maps no longer abort the remaining groups/aliases.
 - Inactive-user SOB pending list: the pending send-on-behalf list is synced to the
   applied value, so repeated cycles do not wipe `sender_acl`.
+- ACL group members are stored in the local database as resolved mail addresses
+  instead of member DNs, so the ACLs of members deleted from Active Directory are
+  actually removed. Members that no longer exist or have no mail address are skipped
+  with a warning instead of aborting the permission sync. The first run after
+  upgrading re-diffs the stored entries once.
+- Send-on-behalf lists are replaced each cycle by the union of the SOB groups a user
+  is in, so removals from SOB groups propagate to `sender_acl`. When a SOB group
+  cannot be read, updates are additive only, so a transient failure never wipes
+  sender ACLs.
+- doveadm HTTP failures (non-2xx status, invalid or empty JSON) abort the sync
+  instead of silently counting as success.
+- The alias dictionary handles multi-target aliases (`goto` with several
+  comma-separated targets) and expands nested alias chains transitively, so an
+  alias behind another alias is included in the SOB list and BCC maps of the
+  mailbox the chain ends at. Group members are resolved in batched LDAP searches
+  (chunks of 50) instead of one search per member.
 - The mailcow-MariaDB signature module (`editUserSignatures`) was dead code and is
   not ported. The dovecot/SOGo login configuration templates were removed entirely.
 

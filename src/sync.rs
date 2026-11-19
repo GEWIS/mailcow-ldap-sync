@@ -1,12 +1,10 @@
-use std::collections::HashMap;
-use std::time::Duration;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use ldap3::{Ldap, LdapConnAsync, Scope, SearchEntry, drive};
 use log::{error, info, warn};
 use serde_json::json;
 use sqlx::SqlitePool;
-use tokio::time::sleep;
 
 use crate::alias_sync::{AliasDictionary, get_alias_dictionary};
 use crate::config::Config;
@@ -16,8 +14,8 @@ use crate::mailcow_api::MailcowApi;
 use crate::types::{AdUser, BccMap, Mailbox, Permission};
 
 const CONSOLE_LOG_LINE_LENGTH: usize = 40;
-/// The alias dictionary is refreshed when it is older than one hour.
-const ALIAS_REFRESH_INTERVAL: Duration = Duration::from_secs(3600);
+/// LDAP result code for a base DN that does not exist.
+const LDAP_NO_SUCH_OBJECT: u32 = 32;
 
 fn console_log_line() -> String {
     "-".repeat(CONSOLE_LOG_LINE_LENGTH)
@@ -33,6 +31,11 @@ struct Ctx<'a> {
     bcc_maps: Vec<BccMap>,
     users: Vec<AdUser>,
     session_time: i64,
+    /// Desired send-on-behalf list per member, accumulated while syncing SOB groups.
+    sob_desired: HashMap<String, BTreeSet<String>>,
+    /// SOB groups attempted and read successfully in this run.
+    sob_attempted: u32,
+    sob_succeeded: u32,
 }
 
 impl Ctx<'_> {
@@ -41,17 +44,6 @@ impl Ctx<'_> {
             .as_ref()
             .and_then(|dict| dict.emails.get(mail).cloned())
             .unwrap_or_default()
-    }
-
-    async fn refresh_aliases(&mut self) -> Result<()> {
-        let expired = self
-            .aliases
-            .as_ref()
-            .is_some_and(|dict| dict.last_update.elapsed() > ALIAS_REFRESH_INTERVAL);
-        if self.aliases.is_none() || expired {
-            self.aliases = Some(get_alias_dictionary(&self.mailcow).await?);
-        }
-        Ok(())
     }
 }
 
@@ -90,11 +82,15 @@ pub async fn run_sync(config: &Config) -> Result<()> {
         bcc_maps: Vec::new(),
         users,
         session_time,
+        sob_desired: HashMap::new(),
+        sob_attempted: 0,
+        sob_succeeded: 0,
     };
     synchronize_users(&ctx).await?;
 
     info!("{line}\n SYNCING ALL PERMISSIONS \n{line}");
-    ctx.refresh_aliases().await?;
+    // Aliases are used by the SOB and BCC sync below; fetch a fresh dictionary per run.
+    ctx.aliases = Some(get_alias_dictionary(&ctx.mailcow).await?);
     ctx.bcc_maps = ctx.mailcow.get_bcc_maps().await?;
     synchronize_permissions(&mut ctx).await?;
 
@@ -158,36 +154,86 @@ fn ad_user_from_entry(entry: SearchEntry) -> AdUser {
     }
 }
 
-async fn ldap_search(ldap: &mut Ldap, base_dn: &str, attributes: &[&str]) -> Result<Vec<SearchEntry>> {
-    let (entries, _) = ldap
-        .search(base_dn, Scope::Subtree, "(objectClass=*)", attributes)
-        .await?
-        .success()?;
-    Ok(entries.into_iter().map(SearchEntry::construct).collect())
+/// Search under a base DN. `Ok(None)` means the base DN does not exist
+/// (deleted object) instead of aborting the whole sync run.
+async fn ldap_search(
+    ldap: &mut Ldap,
+    base_dn: &str,
+    filter: &str,
+    attributes: &[&str],
+) -> Result<Option<Vec<SearchEntry>>> {
+    let search = ldap.search(base_dn, Scope::Subtree, filter, attributes).await?;
+    if search.1.rc == LDAP_NO_SUCH_OBJECT {
+        return Ok(None);
+    }
+    let (entries, _) = search.success()?;
+    Ok(Some(entries.into_iter().map(SearchEntry::construct).collect()))
 }
 
-/// Search Active Directory users on DN and return their mails.
+/// Search Active Directory users and return their mails. Members are resolved with
+/// batched OR-filtered searches against the base DN to limit the number of
+/// round-trips. Members whose object no longer exists or has no mail address are
+/// skipped (summarized in a warning); duplicates and the mailbox owner are dropped.
 async fn resolve_member_mails(
     ldap: &mut Ldap,
+    base_dn: &str,
     member_dns: &[String],
     skip_mail: &str,
 ) -> Result<Vec<String>> {
+    // Keep the OR filter well below AD's filter size limits.
+    const BATCH_SIZE: usize = 50;
+
     let mut mails = Vec::new();
-    for dn in member_dns {
-        let entries = ldap_search(ldap, dn, &["mail"]).await?;
-        if let Some(mail) = entries
-            .first()
-            .and_then(|entry| entry.attrs.get("mail"))
-            .and_then(|values| values.first())
-        {
-            // We do not want to set permissions for owner of the mailbox.
-            if mail != skip_mail {
+    let mut seen: HashSet<String> = HashSet::new();
+    for batch in member_dns.chunks(BATCH_SIZE) {
+        let filter = format!(
+            "(|{})",
+            batch
+                .iter()
+                .map(|dn| format!("(distinguishedName={})", escape_filter(dn)))
+                .collect::<String>()
+        );
+        let Some(entries) = ldap_search(ldap, base_dn, &filter, &["mail"]).await? else {
+            warn!("Could not resolve {} member DNs: none exist anymore", batch.len());
+            continue;
+        };
+
+        let found: HashSet<String> = entries.iter().map(|entry| entry.dn.to_lowercase()).collect();
+        let missing = batch.iter().filter(|dn| !found.contains(&dn.to_lowercase())).count();
+        if missing > 0 {
+            warn!(
+                "{missing} of {} member DNs could not be resolved to a mail address",
+                batch.len()
+            );
+        }
+
+        for entry in &entries {
+            let Some(mail) = entry.attrs.get("mail").and_then(|values| values.first()) else {
+                continue;
+            };
+            // We do not want to set permissions for the owner of the mailbox.
+            if mail.is_empty() || mail == skip_mail {
+                continue;
+            }
+            // Distinct AD objects can resolve to the same mail address; keep one entry.
+            if seen.insert(mail.clone()) {
                 mails.push(mail.clone());
             }
         }
-        sleep(Duration::from_millis(10)).await;
     }
     Ok(mails)
+}
+
+/// Escape a value for use inside an LDAP filter (RFC 4515).
+fn escape_filter(value: &str) -> String {
+    let mut out = Vec::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        match byte {
+            b'*' | b'(' | b')' | b'\\' | 0 => out.extend_from_slice(format!("\\{byte:02x}").as_bytes()),
+            _ => out.push(byte),
+        }
+    }
+    String::from_utf8(out).expect("filter escaping preserves UTF-8")
 }
 
 /// Synchronize LDAP users with Mailcow mailboxes and the users stored in the local DB.
@@ -300,6 +346,28 @@ async fn synchronize_permissions(ctx: &mut Ctx<'_>) -> Result<()> {
         }
     }
 
+    // Apply the accumulated desired send-on-behalf lists. When every SOB group was
+    // read successfully the pending lists are fully replaced, so removals from SOB
+    // groups propagate; otherwise only members seen this cycle are updated, so a
+    // transient failure can never wipe sender ACLs.
+    if ctx.sob_attempted == ctx.sob_succeeded {
+        for email in local_db::get_all_emails(ctx.local).await? {
+            let desired: Vec<String> = ctx
+                .sob_desired
+                .get(&email)
+                .map(|sobs| sobs.iter().cloned().collect())
+                .unwrap_or_default();
+            local_db::set_sob_pending(ctx.local, &email, &desired).await?;
+        }
+    } else {
+        for (email, sobs) in &ctx.sob_desired {
+            let desired: Vec<String> = sobs.iter().cloned().collect();
+            if !local_db::set_sob_pending(ctx.local, email, &desired).await? {
+                warn!("Skipping send-on-behalf of {email}: not present in the local database");
+            }
+        }
+    }
+
     for user in local_db::get_sob_changed_users(ctx.local).await? {
         if let Err(e) = apply_sob(ctx, &user).await {
             error!("Ran into an issue when syncing send on behalf of {}: {e:#}", user.email);
@@ -334,25 +402,29 @@ async fn synchronize_user_permissions(ctx: &mut Ctx<'_>, user: &AdUser) -> Resul
 /// Synchronize one ACL permission of a user with Active Directory.
 async fn synchronize_user_acl(ctx: &mut Ctx<'_>, user: &AdUser, permission: Permission) -> Result<()> {
     let group_dn = user.permission_value(permission).to_string();
-    let entries = ldap_search(ctx.ldap, &group_dn, &["memberFlattened"]).await?;
-    let members = entries
+    let Some(entries) = ldap_search(ctx.ldap, &group_dn, "(objectClass=*)", &["memberFlattened"]).await?
+    else {
+        bail!("ACL group {group_dn} of {} no longer exists in Active Directory", user.mail);
+    };
+    let member_dns = entries
         .first()
         .and_then(|entry| entry.attrs.get("memberFlattened").cloned())
         .unwrap_or_default();
+    // Members are stored as resolved mail addresses, so the permissions of users
+    // deleted from Active Directory can still be removed afterwards.
+    let mails = resolve_member_mails(ctx.ldap, &ctx.config.ldap_base_dn, &member_dns, &user.mail).await?;
 
     let (changed, local_user) =
-        local_db::get_permission_changes(ctx.local, &user.mail, members, permission).await?;
+        local_db::get_permission_changes(ctx.local, &user.mail, mails, permission).await?;
 
     if !changed.new_users.is_empty() {
         info!("User(s) {} added to {} for {permission:?}", changed.new_users.join(", "), user.mail);
-        let mails = resolve_member_mails(ctx.ldap, &changed.new_users, &user.mail).await?;
-        ctx.dovecot.set_permissions(&user.mail, &mails, permission, false).await?;
+        ctx.dovecot.set_permissions(&user.mail, &changed.new_users, permission, false).await?;
     }
 
     if !changed.removed_users.is_empty() {
         info!("Removing User(s) {} from {} for {permission:?}", changed.removed_users.join(", "), user.mail);
-        let mails = resolve_member_mails(ctx.ldap, &changed.removed_users, &user.mail).await?;
-        ctx.dovecot.set_permissions(&user.mail, &mails, permission, true).await?;
+        ctx.dovecot.set_permissions(&user.mail, &changed.removed_users, permission, true).await?;
     }
 
     // Only update the local user if everything went well.
@@ -360,26 +432,24 @@ async fn synchronize_user_acl(ctx: &mut Ctx<'_>, user: &AdUser, permission: Perm
     Ok(())
 }
 
-/// Synchronize the send-on-behalf list of all members of a user's SOB group.
+/// Collect the desired send-on-behalf list of every member of a user's SOB group.
+/// The lists are applied after all users have been processed, so a user that is in
+/// multiple SOB groups ends up with the union of all of them.
 async fn synchronize_user_sob(ctx: &mut Ctx<'_>, user: &AdUser) -> Result<()> {
+    ctx.sob_attempted += 1;
     let group_dn = user.mail_perm_sob.clone();
-    let entries = ldap_search(ctx.ldap, &group_dn, &["memberFlattened"]).await?;
-    let sobs: Vec<String> =
-        std::iter::once(user.mail.clone()).chain(ctx.alias_emails(&user.mail)).collect();
+    let Some(entries) = ldap_search(ctx.ldap, &group_dn, "(objectClass=*)", &["memberFlattened"]).await?
+    else {
+        bail!("SOB group {group_dn} of {} no longer exists in Active Directory", user.mail);
+    };
+    ctx.sob_succeeded += 1;
 
-    for entry in entries {
+    let sobs: BTreeSet<String> =
+        std::iter::once(user.mail.clone()).chain(ctx.alias_emails(&user.mail)).collect();
+    for entry in &entries {
         let members = entry.attrs.get("memberFlattened").cloned().unwrap_or_default();
-        for member_dn in members {
-            let member_entries = ldap_search(ctx.ldap, &member_dn, &["mail"]).await?;
-            let Some(member_mail) = member_entries
-                .first()
-                .and_then(|entry| entry.attrs.get("mail"))
-                .and_then(|values| values.first())
-                .cloned()
-            else {
-                continue;
-            };
-            local_db::edit_local_user_permissions(ctx.local, &member_mail, &sobs).await?;
+        for mail in resolve_member_mails(ctx.ldap, &ctx.config.ldap_base_dn, &members, "").await? {
+            ctx.sob_desired.entry(mail).or_default().extend(sobs.iter().cloned());
         }
     }
     Ok(())
@@ -417,4 +487,16 @@ async fn synchronize_bcc_maps(ctx: &mut Ctx<'_>, user: &AdUser) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_filter;
+
+    #[test]
+    fn filter_escaping() {
+        assert_eq!(escape_filter("CN=User,DC=example,DC=local"), "CN=User,DC=example,DC=local");
+        assert_eq!(escape_filter("OU=IT (Infra),DC=x"), "OU=IT \\28Infra\\29,DC=x");
+        assert_eq!(escape_filter("a\\b*c"), "a\\5cb\\2ac");
+    }
 }

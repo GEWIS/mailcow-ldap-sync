@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Value, json};
 use tokio::time::{Duration, sleep};
@@ -39,8 +39,20 @@ impl DovecotApi {
             .header("Authorization", &self.authorization)
             .json(&payload)
             .send()
-            .await?;
-        Ok(response.json().await.unwrap_or(Value::Null))
+            .await
+            .context("doveadm request failed")?;
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .with_context(|| format!("doveadm returned invalid JSON (HTTP {status})"))?;
+        if !status.is_success() {
+            bail!("doveadm request failed (HTTP {status}): {body}");
+        }
+        if body.is_null() {
+            bail!("doveadm returned an empty response (HTTP {status})");
+        }
+        Ok(body)
     }
 
     /// Get all mailbox subfolders of a mail, excluding shared folders.
@@ -48,15 +60,18 @@ impl DovecotApi {
         let payload = json!([["mailbox-list", { "user": mail }, "get-subfolders"]]);
         let response = self.post(payload).await?;
 
+        let Some(entries) = response.get(0).and_then(|row| row.get(1)).and_then(Value::as_array)
+        else {
+            bail!("Unexpected doveadm mailbox-list response: {response}");
+        };
+
         let mut subfolders = Vec::new();
-        if let Some(entries) = response.get(0).and_then(|row| row.get(1)).and_then(Value::as_array) {
-            for entry in entries {
-                if let Some(mailbox) = entry.get("mailbox").and_then(Value::as_str) {
-                    if mailbox.starts_with("Shared") {
-                        continue;
-                    }
-                    subfolders.push(mailbox.to_string());
+        for entry in entries {
+            if let Some(mailbox) = entry.get("mailbox").and_then(Value::as_str) {
+                if mailbox.starts_with("Shared") {
+                    continue;
                 }
+                subfolders.push(mailbox.to_string());
             }
         }
         Ok(subfolders)
@@ -75,7 +90,9 @@ impl DovecotApi {
         remove: bool,
     ) -> Result<()> {
         let (subfolders, permission_tag): (Vec<String>, &str) = match permission {
-            Permission::RoInbox => (vec!["INBOX".into(), "Inbox".into()], "PermROInbox"),
+            // Dovecot matches INBOX case-insensitively, so a single entry covers
+            // every casing a client may have used.
+            Permission::RoInbox => (vec!["INBOX".into()], "PermROInbox"),
             Permission::RoSent => (vec!["Sent".into()], "PermROSent"),
             Permission::Ro | Permission::Rw => {
                 let subfolders = self.get_mailbox_subfolders(mail).await?;
