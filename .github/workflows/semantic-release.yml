@@ -14,7 +14,7 @@ jobs:
     needs: versioning
     if: ${{ needs.versioning.outputs.next-version != '' }}
     with:
-      projects: "['.']"
+      projects: '["."]'
       version: ${{ needs.versioning.outputs.next-version }}
-      docker-paths: "['mailcow-ldap-sync']"
+      docker-paths: '["mailcow-ldap-sync"]'
       github-registry: 'true'
