@@ -16,9 +16,5 @@ jobs:
     with:
       projects: "['.']"
       version: ${{ needs.versioning.outputs.next-version }}
-      docker-registry: 'cbc.docker-registry.gewis.nl'
       docker-paths: "['mailcow-ldap-sync']"
       github-registry: 'true'
-    secrets:
-      REGISTRY_USERNAME: ${{ secrets.SVC_GH_CBC_USERNAME }}
-      REGISTRY_PASSWORD: ${{ secrets.SVC_GH_CBC_PWD }}
