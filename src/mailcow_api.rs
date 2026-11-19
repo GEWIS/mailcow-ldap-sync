@@ -34,7 +34,9 @@ pub struct MailcowApi {
 
 impl MailcowApi {
     pub fn new(api_host: &str, api_key: &str) -> Result<Self> {
-        let mut base_url = api_host.trim_end_matches('/').to_string();
+        // The client always appends `api/v1/{route}` itself; accept a host with
+        // or without the `/api/v1` suffix (the TS client required the suffix).
+        let mut base_url = api_host.trim_end_matches('/').trim_end_matches("/api/v1").to_string();
         base_url.push('/');
         Ok(Self { http: reqwest::Client::new(), base_url, api_key: api_key.to_string() })
     }
