@@ -15,6 +15,15 @@ const RO_RIGHTS: [&str; 4] = ["lookup", "read", "write", "write-seen"];
 const RW_EXTRA_RIGHTS: [&str; 6] =
     ["write-deleted", "insert", "post", "expunge", "create", "delete"];
 
+/// Rights granted for a permission type (the same set `set_permissions` applies).
+pub fn rights_for(permission: Permission) -> Vec<&'static str> {
+    let mut rights: Vec<&'static str> = RO_RIGHTS.to_vec();
+    if permission == Permission::Rw {
+        rights.extend(RW_EXTRA_RIGHTS);
+    }
+    rights
+}
+
 /// Client for the doveadm HTTP API used to manage Dovecot ACLs.
 pub struct DovecotApi {
     http: reqwest::Client,
@@ -24,9 +33,13 @@ pub struct DovecotApi {
 
 impl DovecotApi {
     pub fn new(doveadm_api_key: &str) -> Self {
+        Self::with_base_url(doveadm_api_key, DOVEADM_BASE_URL)
+    }
+
+    pub(crate) fn with_base_url(doveadm_api_key: &str, base_url: &str) -> Self {
         Self {
             http: reqwest::Client::new(),
-            base_url: DOVEADM_BASE_URL.to_string(),
+            base_url: base_url.to_string(),
             authorization: format!("X-Dovecot-API {}", STANDARD.encode(doveadm_api_key)),
         }
     }
@@ -77,6 +90,32 @@ impl DovecotApi {
         Ok(subfolders)
     }
 
+    /// Read the ACL entries of one folder (`doveadm acl-get`). Returns
+    /// `(id, rights)` pairs, e.g. `("user=a@example.local", ["lookup", "read", ...])`.
+    pub async fn get_acl(&self, mail: &str, folder: &str) -> Result<Vec<(String, Vec<String>)>> {
+        let payload = json!([["acl-get", { "user": mail, "mailbox": folder }, "acl-get"]]);
+        let response = self.post(payload).await?;
+
+        let Some(entries) = response.get(0).and_then(|row| row.get(1)).and_then(Value::as_array)
+        else {
+            bail!("Unexpected doveadm acl-get response: {response}");
+        };
+
+        let mut acls = Vec::new();
+        for entry in entries {
+            let id = entry.get("id").and_then(Value::as_str);
+            let rights: Option<Vec<String>> = entry
+                .get("rights")
+                .and_then(Value::as_array)
+                .map(|rights| rights.iter().filter_map(Value::as_str).map(String::from).collect());
+            match (id, rights) {
+                (Some(id), Some(rights)) => acls.push((id.to_string(), rights)),
+                _ => bail!("Unexpected acl-get entry in doveadm response: {entry}"),
+            }
+        }
+        Ok(acls)
+    }
+
     /// Set (or remove) read/write permissions in dovecot.
     ///
     /// Deviation from the TS source: a truthiness bug there made every permission
@@ -101,10 +140,7 @@ impl DovecotApi {
             }
         };
 
-        let mut rights: Vec<&str> = RO_RIGHTS.to_vec();
-        if permission == Permission::Rw {
-            rights.extend(RW_EXTRA_RIGHTS);
-        }
+        let rights = rights_for(permission);
 
         let command = if remove { "aclRemove" } else { "aclSet" };
         let mut requests = Vec::new();

@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 
 const ENV_PREFIX: &str = "LDAP-MAILCOW_";
 const DEFAULT_LDAP_FILTER: &str = "(&(objectClass=user)(objectCategory=person))";
+/// Nightly by default.
+const DEFAULT_CONSOLIDATE_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 /// Runtime configuration, built from environment variables.
 pub struct Config {
@@ -17,6 +19,8 @@ pub struct Config {
     pub max_ldap_retry_count: u32,
     /// `LDAP-MAILCOW_SYNC_INTERVAL` in seconds. `None` or `0`: run once and exit.
     pub sync_interval: Option<u64>,
+    /// Seconds between consolidation runs (report-only drift check). `0` disables.
+    pub consolidate_interval: u64,
 }
 
 impl Config {
@@ -38,6 +42,13 @@ impl Config {
             }
             Err(_) => None,
         };
+        let consolidate_interval =
+            match std::env::var(format!("{ENV_PREFIX}CONSOLIDATE_INTERVAL")) {
+                Ok(value) => value
+                    .parse::<u64>()
+                    .context("LDAP-MAILCOW_CONSOLIDATE_INTERVAL must be a number")?,
+                Err(_) => DEFAULT_CONSOLIDATE_INTERVAL_SECS,
+            };
 
         Ok(Self {
             ldap_uri: required("LDAP_URI")?,
@@ -53,6 +64,7 @@ impl Config {
             max_inactive_count,
             max_ldap_retry_count,
             sync_interval,
+            consolidate_interval,
         })
     }
 }
