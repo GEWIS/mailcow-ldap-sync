@@ -1,12 +1,13 @@
 mod alias_sync;
 mod config;
+mod consolidation;
 mod dovecot_api;
 mod local_db;
 mod mailcow_api;
 mod sync;
 mod types;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use log::{error, info};
@@ -21,6 +22,8 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let sync_interval = config.sync_interval;
+    let consolidate_interval = config.consolidate_interval;
+    let mut last_consolidation: Option<Instant> = None;
 
     loop {
         if let Err(e) = sync::run_sync(&config).await {
@@ -30,6 +33,17 @@ async fn main() -> Result<()> {
             }
         } else {
             info!("Finished!");
+        }
+
+        // Nightly consolidation: report drift between mailcow/dovecot and the
+        // local database. Runs after a sync cycle, once the interval elapsed.
+        if consolidate_interval > 0
+            && last_consolidation.is_none_or(|last| last.elapsed().as_secs() >= consolidate_interval)
+        {
+            if let Err(e) = consolidation::run(&config).await {
+                error!("Consolidation run failed: {e:#}");
+            }
+            last_consolidation = Some(Instant::now());
         }
 
         match sync_interval {

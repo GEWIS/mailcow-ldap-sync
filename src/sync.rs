@@ -63,7 +63,7 @@ pub async fn run_sync(config: &Config) -> Result<()> {
         .context("Ran into an issue when binding to Active Directory.")?;
 
     info!("{line}\n INITIALIZING DATABASES AND API CLIENTS \n{line}");
-    let local = local_db::initialize("db/ldap-mailcow.sqlite3").await?;
+    let local = local_db::initialize(local_db::DB_PATH).await?;
     let mailcow = MailcowApi::new(&config.api_host, &config.api_key)?;
     let dovecot = DovecotApi::new(&config.doveadm_api_key);
 

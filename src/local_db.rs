@@ -66,6 +66,9 @@ CREATE TABLE IF NOT EXISTS users (
 const SELECT_COLUMNS: &str = "email, active, displayName, inactiveCount, \
      mailPermRO, mailPermRW, mailPermROInbox, mailPermROSent, mailPermSOB, newMailPermSOB";
 
+/// Location of the local state database (relative to the working directory).
+pub const DB_PATH: &str = "db/ldap-mailcow.sqlite3";
+
 /// Initialize the database connection, creating the schema if it does not exist yet.
 pub async fn initialize(db_path: &str) -> Result<SqlitePool> {
     if let Some(dir) = Path::new(db_path).parent() {
@@ -197,6 +200,12 @@ pub async fn get_all_emails(pool: &SqlitePool) -> Result<Vec<String>> {
     Ok(rows.into_iter().filter_map(|row| row.try_get("email").ok()).collect())
 }
 
+/// Get all stored users, without side effects.
+pub async fn get_all_users(pool: &SqlitePool) -> Result<Vec<LocalUser>> {
+    let rows = sqlx::query(&format!("SELECT {SELECT_COLUMNS} FROM users")).fetch_all(pool).await?;
+    Ok(rows.iter().map(user_from_row).collect::<sqlx::Result<Vec<_>>>()?)
+}
+
 /// Replace a user's pending send-on-behalf list (sorted, deduplicated). An empty
 /// list clears the pending entries, so removals from SOB groups propagate.
 /// Returns `false` when the user does not exist in the local database.
@@ -282,17 +291,17 @@ pub async fn get_permission_changes(
 }
 
 #[cfg(test)]
+pub(crate) async fn test_pool() -> SqlitePool {
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let path = std::env::temp_dir().join(format!("ldap-sync-test-{}-{id}.sqlite3", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    initialize(path.to_str().unwrap()).await.expect("db init")
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    async fn test_pool() -> SqlitePool {
-        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let path = std::env::temp_dir()
-            .join(format!("ldap-sync-test-{}-{id}.sqlite3", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        initialize(path.to_str().unwrap()).await.expect("db init")
-    }
 
     #[tokio::test]
     async fn get_user_marks_last_seen() {

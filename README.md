@@ -10,7 +10,9 @@ It periodically:
 - syncs mailbox ACLs (read/read-write on folders) through the doveadm HTTP API from `mailPermRO`, `mailPermROInbox`, `mailPermROSent`, `mailPermRW` group attributes,
 - syncs *send on behalf* (`sender_acl`) from `mailPermSOB` groups (including mailcow aliases),
 - adds sender BCC maps for AD groups named `*MAIL-BCC-self*`,
-- keeps its own SQLite state database in `db/` so mailcow is only touched when something actually changed.
+- keeps its own SQLite state database in `db/` so mailcow is only touched when something actually changed,
+- runs a **nightly consolidation** (report-only) that compares what mailcow and
+  dovecot actually serve with the SQLite state and logs every difference.
 
 ## Prerequisites
 
@@ -66,7 +68,30 @@ doveadm_api_key = <DOVEADM_API_KEY>
 - `LDAP-MAILCOW_MAX_LDAP_RETRY_COUNT` - how often to retry when the LDAP search returns no users.
 - `DOVEADM_API_KEY` - doveadm HTTP API key for the ACL endpoints.
 - `LDAP-MAILCOW_SYNC_INTERVAL` (optional) - seconds between sync cycles. Unset or `0`: run once and exit.
+- `LDAP-MAILCOW_CONSOLIDATE_INTERVAL` (optional) - seconds between consolidation runs. Defaults to `86400` (nightly); `0` disables.
 - `LDAP-MAILCOW_LDAP_FILTER` (optional) - LDAP filter to apply, defaults to `(&(objectClass=user)(objectCategory=person))`.
+
+## Consolidation
+
+After every sync cycle (and once before exiting in run-once mode), once the
+consolidation interval has elapsed, the tool compares what mailcow and the
+doveadm HTTP API actually report with the local SQLite state and **logs every
+difference as a warning**. It checks, per stored user:
+
+- the mailbox exists in mailcow,
+- the `active` state and display name match,
+- `sender_acl` matches the recorded send-on-behalf list,
+- the Dovecot ACLs match the recorded `mailPerm*` members: for every recorded
+  member, the expected rights on the expected folders (`INBOX` for
+  `mailPermROInbox`, `Sent` for `mailPermROSent`, every non-shared folder for
+  `mailPermRO`/`mailPermRW`).
+
+The consolidation is **report-only**: it never writes to mailcow, dovecot, or
+the local database. It catches drift the incremental sync cannot see, e.g.
+manual changes in the mailcow UI, doveadm requests that silently failed inside
+a 200 response, and folders created after the last permission change. Items it
+cannot verify (missing API fields, unreadable ACLs) are counted and logged
+instead of being reported as drift.
 
 ## Limitations
 

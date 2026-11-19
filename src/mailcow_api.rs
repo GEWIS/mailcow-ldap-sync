@@ -1,8 +1,34 @@
 use anyhow::{Context, Result, bail};
 use rand::Rng;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
 use crate::types::{Alias, BccMap, Mailbox};
+
+/// A mailbox as observed on the mailcow server, used by the consolidation report.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ObservedMailbox {
+    /// Full address; `None` for rows the API reports without one.
+    pub username: Option<String>,
+    #[serde(default)]
+    pub active_int: i64,
+    #[serde(default)]
+    pub name: String,
+    /// The addresses this mailbox may send as. `None` when the API does not
+    /// report the field, meaning the consolidation cannot verify it.
+    #[serde(default, deserialize_with = "tolerant_string_list")]
+    pub sender_acl: Option<Vec<String>>,
+}
+
+/// Accepts a JSON array of strings, mapping anything else to `None` instead of
+/// failing the whole mailbox list.
+fn tolerant_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
+}
 
 /// ACL flags granted to every newly created mailbox (mirrors the TS client).
 const DEFAULT_USER_ACL: [&str; 7] = [
@@ -136,6 +162,12 @@ impl MailcowApi {
     pub async fn get_aliases(&self) -> Result<Vec<Alias>> {
         let body = self.get("get/alias/all").await?;
         serde_json::from_value(body).context("Unexpected alias response from Mailcow API")
+    }
+
+    /// Get all mailboxes registered in mailcow, as the server reports them.
+    pub async fn get_all_mailboxes(&self) -> Result<Vec<ObservedMailbox>> {
+        let body = self.get("get/mailbox/all").await?;
+        serde_json::from_value(body).context("Unexpected mailbox list response from Mailcow API")
     }
 
     /// Get all BCC maps currently registered in mailcow.
