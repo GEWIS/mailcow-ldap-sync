@@ -70,7 +70,7 @@ doveadm_api_key = <DOVEADM_API_KEY>
 
 ## Limitations
 
-- **Two-way sync**: users from LDAP are added to mailcow, not vice-versa — by design.
+- **Two-way sync**: users from LDAP are added to mailcow, not vice-versa — by design. This might be coming soon.
 - Coming from the upstream project, login with LDAP credentials in Dovecot/SOGo is **not** provided by this tool.
 
 ## Deviations from the TypeScript source
