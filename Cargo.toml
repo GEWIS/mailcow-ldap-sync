@@ -1,0 +1,21 @@
+[package]
+name = "mailcow-ldap-sync"
+version = "1.0.0"
+edition = "2021"
+description = "Syncs LDAP (e.g. Active Directory) users into mailcow-dockerized and enables LDAP authentication for Dovecot and SOGo. Rust port of custommailcow-ldap."
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+env_logger = "0.11"
+ldap3 = { version = "0.11", default-features = false, features = ["tls-rustls"] }
+log = "0.4"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[profile.release]
+strip = true

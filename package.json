@@ -1,0 +1,9 @@
+{
+  "name": "mailcow-ldap-sync",
+  "version": "1.0.0",
+  "description": "LDAP-to-mailcow user and permission synchronization (Rust)",
+  "private": true,
+  "devDependencies": {
+    "@gewis/release-config": "^2.4.0"
+  }
+}
